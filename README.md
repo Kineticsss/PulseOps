@@ -1,2 +1,3 @@
-# Boredom-Version-1---Title-To-Be-Decided
-When boredom strikes, build something - Part 1
+# PulseOps
+## What am I?
+An intelligent, explainable anomaly detection and root cause analysis system for server infrastructure using causal inference and large language models
