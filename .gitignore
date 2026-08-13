@@ -1,0 +1,16 @@
+﻿# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+*.egg-info/
+dist/
+build/
+.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
