@@ -1,33 +1,43 @@
 ﻿"""
-PulseOps - backend/main.py
-===========================
-Ingestion API: receives snapshots from agents, stores and exposes them.
+PulseOps - backend/main.py (Phase 2)
+======================================
+Updated to write snapshots to TimescaleDB instead of in-memory store.
+The API surface stays exactly the same - the agent does not need any changes.
 
-CS 413 (Adv. Software Eng.):
-  FastAPI validates incoming JSON via Pydantic automatically.
-  Bad requests are rejected before your code runs.
-  Visit /docs when running for a free interactive API explorer.
-
-Run with:
-  uvicorn backend.main:app --reload --port 8000
+CS 413 (Adv. Software Eng.) - This is the Open/Closed Principle:
+  The API is open for extension (we added a database) but closed for
+  modification (the agent and any existing clients see no difference).
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from sqlalchemy import text
 from typing import Any
 from datetime import datetime, timezone
-from collections import defaultdict
+
+from backend.database import init_db, get_db
+from backend.models import Metric
 
 app = FastAPI(
     title="PulseOps API",
     description="Ingestion and query API for the PulseOps monitoring agent",
-    version="0.1.0",
+    version="0.2.0",
 )
 
-MAX_SNAPSHOTS_PER_SERVER = 200
-metrics_store: dict[str, list] = defaultdict(list)
+
+# ── Startup ───────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+def startup():
+    """
+    Runs once when the API starts.
+    Creates tables if they do not exist yet.
+    Safe to run multiple times - uses IF NOT EXISTS internally.
+    """
+    init_db()
 
 
+# ── Models ────────────────────────────────────────────────────────────────────
 class SnapshotPayload(BaseModel):
     server_id:     str
     timestamp:     str
@@ -37,81 +47,112 @@ class SnapshotPayload(BaseModel):
     network:       dict[str, Any]
     top_processes: list[dict[str, Any]]
 
-class ServerSummary(BaseModel):
-    server_id:             str
-    snapshot_count:        int
-    latest_timestamp:      str | None
-    latest_cpu_percent:    float | None
-    latest_memory_percent: float | None
 
-
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    """Health check."""
     return {
         "service": "PulseOps API",
         "status":  "running",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "time":    datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.post("/api/metrics", status_code=201)
-def ingest_metrics(payload: SnapshotPayload):
+def ingest_metrics(payload: SnapshotPayload, db: Session = Depends(get_db)):
     """
-    201 Created = correct status for storing a new resource.
-    200 OK = processed your request (slightly different semantics).
+    Writes the snapshot to TimescaleDB.
+
+    Depends(get_db) is FastAPI's dependency injection.
+    FastAPI calls get_db(), passes the session to this function,
+    and closes the session automatically when the request is done.
+    We never manually open or close DB sessions in route handlers.
     """
-    data = payload.model_dump()
-    metrics_store[payload.server_id].append(data)
-    if len(metrics_store[payload.server_id]) > MAX_SNAPSHOTS_PER_SERVER:
-        metrics_store[payload.server_id] = metrics_store[payload.server_id][-MAX_SNAPSHOTS_PER_SERVER:]
+    metric = Metric(
+        timestamp      = datetime.fromisoformat(payload.timestamp),
+        server_id      = payload.server_id,
+        cpu            = payload.cpu,
+        memory         = payload.memory,
+        disk           = payload.disk,
+        network        = payload.network,
+        processes      = payload.top_processes,
+        # Extract convenience columns for fast queries
+        cpu_percent    = payload.cpu.get("percent_total"),
+        memory_percent = payload.memory.get("ram", {}).get("percent_used"),
+    )
+    db.add(metric)
+    db.commit()
+
     return {
-        "status":           "accepted",
-        "server_id":        payload.server_id,
-        "stored_snapshots": len(metrics_store[payload.server_id]),
+        "status":    "accepted",
+        "server_id": payload.server_id,
+        "timestamp": payload.timestamp,
     }
 
 
 @app.get("/api/servers")
-def list_servers() -> list[ServerSummary]:
-    """Lists all servers that have sent at least one snapshot."""
-    summaries = []
-    for server_id, snapshots in metrics_store.items():
-        if not snapshots:
-            continue
-        latest = snapshots[-1]
-        summaries.append(ServerSummary(
-            server_id             = server_id,
-            snapshot_count        = len(snapshots),
-            latest_timestamp      = latest.get("timestamp"),
-            latest_cpu_percent    = latest.get("cpu", {}).get("percent_total"),
-            latest_memory_percent = latest.get("memory", {}).get("ram", {}).get("percent_used"),
-        ))
-    return summaries
+def list_servers(db: Session = Depends(get_db)):
+    """Lists all servers with their latest CPU and memory readings."""
+    rows = db.execute(text("""
+        SELECT DISTINCT ON (server_id)
+            server_id,
+            timestamp,
+            cpu_percent,
+            memory_percent
+        FROM metrics
+        ORDER BY server_id, timestamp DESC
+    """)).fetchall()
+
+    return [
+        {
+            "server_id":             r.server_id,
+            "latest_timestamp":      r.timestamp.isoformat(),
+            "latest_cpu_percent":    r.cpu_percent,
+            "latest_memory_percent": r.memory_percent,
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/metrics/{server_id}")
-def get_metrics(server_id: str, limit: int = 20):
-    """
-    Path param  : /api/metrics/{server_id}
-    Query param : ?limit=20 (optional, default 20)
-    FastAPI extracts both from the function signature automatically.
-    """
-    if server_id not in metrics_store:
-        raise HTTPException(status_code=404, detail=f"No data for '{server_id}'. Is the agent running?")
-    snapshots = metrics_store[server_id]
+def get_metrics(server_id: str, limit: int = 20, db: Session = Depends(get_db)):
+    """Returns the last N snapshots for a server, newest first."""
+    rows = db.execute(text("""
+        SELECT timestamp, cpu, memory, disk, network, processes,
+               cpu_percent, memory_percent
+        FROM metrics
+        WHERE server_id = :server_id
+        ORDER BY timestamp DESC
+        LIMIT :limit
+    """), {"server_id": server_id, "limit": limit}).fetchall()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No data for '{server_id}'. Is the agent running?"
+        )
+
     return {
-        "server_id":    server_id,
-        "total_stored": len(snapshots),
-        "returned":     min(limit, len(snapshots)),
-        "snapshots":    snapshots[-limit:],
+        "server_id": server_id,
+        "returned":  len(rows),
+        "snapshots": [dict(r._mapping) for r in rows],
     }
 
 
 @app.get("/api/metrics/{server_id}/latest")
-def get_latest(server_id: str):
-    """Most recent snapshot only. Good for a live status widget."""
-    if server_id not in metrics_store or not metrics_store[server_id]:
+def get_latest(server_id: str, db: Session = Depends(get_db)):
+    """Returns the single most recent snapshot for a server."""
+    row = db.execute(text("""
+        SELECT timestamp, cpu, memory, disk, network, processes,
+               cpu_percent, memory_percent
+        FROM metrics
+        WHERE server_id = :server_id
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """), {"server_id": server_id}).fetchone()
+
+    if not row:
         raise HTTPException(status_code=404, detail=f"No data for '{server_id}'")
-    return metrics_store[server_id][-1]
+
+    return dict(row._mapping)
