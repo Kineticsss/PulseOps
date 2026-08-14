@@ -9,6 +9,7 @@ CS 413 (Adv. Software Eng.) - This is the Open/Closed Principle:
   modification (the agent and any existing clients see no difference).
 """
 
+from backend.anomaly import AnomalyDetector
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -156,3 +157,56 @@ def get_latest(server_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"No data for '{server_id}'")
 
     return dict(row._mapping)
+
+@app.get("/api/anomalies/{server_id}/latest")
+def get_latest_anomaly(server_id: str, db: Session = Depends(get_db)):
+    """
+    Analyzes the most recent snapshot against the server's baseline.
+    Returns a severity rating and z-scores for each metric.
+
+    CS 412 - This is the core Data Science output:
+      Instead of raw numbers, we return meaning:
+        "CPU is 3.2 standard deviations above normal — severe anomaly."
+    """
+    detector = AnomalyDetector(db, server_id)
+    result   = detector.analyze_latest()
+
+    if result is None:
+        raise HTTPException(
+            status_code=202,
+            detail="Not enough data yet. Keep the agent running — need at least 10 readings."
+        )
+    return result
+
+
+@app.get("/api/anomalies/{server_id}/history")
+def get_anomaly_history(server_id: str, hours: int = 1, db: Session = Depends(get_db)):
+    """
+    Returns all anomalous readings in the last N hours.
+    Useful for seeing when a problem started, not just that it exists now.
+    """
+    detector  = AnomalyDetector(db, server_id)
+    anomalies = detector.get_anomaly_history(hours=hours)
+    return {
+        "server_id":     server_id,
+        "hours_scanned": hours,
+        "anomaly_count": len(anomalies),
+        "anomalies":     anomalies,
+    }
+
+
+@app.get("/api/baseline/{server_id}")
+def get_baseline(server_id: str, db: Session = Depends(get_db)):
+    """
+    Returns the current rolling baseline for a server.
+    Shows what "normal" looks like right now for this specific server.
+    """
+    detector = AnomalyDetector(db, server_id)
+    baseline = detector.get_baseline()
+
+    if baseline is None:
+        raise HTTPException(
+            status_code=202,
+            detail="Not enough data yet. Need at least 10 readings to establish a baseline."
+        )
+    return {"server_id": server_id, **baseline}
