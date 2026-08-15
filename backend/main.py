@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Any
 from datetime import datetime, timezone
+from backend.analyzer import RootCauseAnalyzer
+from backend.anomaly import AnomalyDetector
 
 from backend.database import init_db, get_db
 from backend.models import Metric
@@ -210,3 +212,36 @@ def get_baseline(server_id: str, db: Session = Depends(get_db)):
             detail="Not enough data yet. Need at least 10 readings to establish a baseline."
         )
     return {"server_id": server_id, **baseline}
+
+@app.post("/api/analyze/{server_id}")
+def analyze_server(server_id: str, db: Session = Depends(get_db)):
+    """
+    Triggers AI root cause analysis for the current anomaly on a server.
+
+    CS 414 - Why POST and not GET?
+      This endpoint has a side effect: it calls an external API (Claude)
+      which costs money and takes time. GET requests should be safe to
+      call repeatedly with no consequences (idempotent).
+      POST signals to clients that this is an action, not a simple read.
+    """
+    # First check if there is actually an anomaly to analyze
+    detector = AnomalyDetector(db, server_id)
+    anomaly  = detector.analyze_latest()
+
+    if anomaly is None:
+        raise HTTPException(
+            status_code=202,
+            detail="Not enough baseline data yet. Keep the agent running."
+        )
+
+    if not anomaly.get("is_anomaly"):
+        return {
+            "server_id": server_id,
+            "message":   "No anomaly detected. Server is behaving normally.",
+            "anomaly":   anomaly,
+        }
+
+    # Anomaly confirmed — run AI analysis
+    analyzer = RootCauseAnalyzer(db)
+    result   = analyzer.analyze(server_id, anomaly)
+    return result
