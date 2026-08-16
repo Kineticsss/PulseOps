@@ -1,22 +1,13 @@
 ﻿"""
 PulseOps - backend/models.py
 ==============================
-Defines the database table structure using SQLAlchemy ORM.
+Defines all database tables using SQLAlchemy ORM.
 
-CS 413 (Adv. Software Eng.) - ORM (Object Relational Mapper):
-  Instead of writing raw SQL to define tables, we define Python classes.
-  SQLAlchemy translates them into the correct SQL for our database.
-  Each class = one table. Each class attribute = one column.
-
-CS 412 (Data Science) - Schema Design for Time-Series:
-  The primary key is (server_id, timestamp) - not just an integer ID.
-  This reflects how we query the data: always by server and time range.
-  JSON columns store nested metric data (cpu, memory, disk, network)
-  so we do not need separate tables for each metric type in Phase 2.
-  We can normalize further in Phase 3 when we know our query patterns.
+Phase 2 added: Metric table
+Phase 5 added: Alert table — stores alert history for cooldown and audit
 """
 
-from sqlalchemy import Column, String, Float, DateTime, JSON
+from sqlalchemy import Column, String, Float, DateTime, JSON, Integer, Boolean
 from sqlalchemy.orm import DeclarativeBase
 from datetime import datetime, timezone
 
@@ -26,37 +17,39 @@ class Base(DeclarativeBase):
 
 
 class Metric(Base):
-    """
-    One row = one snapshot from one server at one point in time.
-
-    Column choices explained:
-      timestamp  - when the snapshot was taken (UTC always)
-      server_id  - which server sent this snapshot
-      cpu        - JSON blob: percent_total, per_core, frequency, etc.
-      memory     - JSON blob: ram and swap breakdowns
-      disk       - JSON blob: partitions and io_counters
-      network    - JSON blob: bytes sent/recv, rates, errors
-      processes  - JSON blob: top 10 processes by CPU at this moment
-
-    Why JSON columns for metrics?
-      Metrics evolve - we might add new fields to cpu or memory later.
-      With JSON columns, adding a field to the agent does not require
-      a database migration. The tradeoff: we cannot query inside JSON
-      as efficiently as dedicated columns. For Phase 2 this is fine.
-      Phase 3 will move high-frequency query fields (cpu percent, memory
-      percent) into dedicated float columns for anomaly detection queries.
-    """
+    """One row = one snapshot from one server at one point in time."""
     __tablename__ = "metrics"
 
-    timestamp  = Column(DateTime(timezone=True), primary_key=True, default=lambda: datetime.now(timezone.utc))
-    server_id  = Column(String, primary_key=True, index=True)
-    cpu        = Column(JSON, nullable=False)
-    memory     = Column(JSON, nullable=False)
-    disk       = Column(JSON, nullable=False)
-    network    = Column(JSON, nullable=False)
-    processes  = Column(JSON, nullable=False)
-
-    # Convenience columns - extracted from JSON for fast queries.
-    # These are the fields anomaly detection will query most often.
+    timestamp      = Column(DateTime(timezone=True), primary_key=True, default=lambda: datetime.now(timezone.utc))
+    server_id      = Column(String, primary_key=True, index=True)
+    cpu            = Column(JSON, nullable=False)
+    memory         = Column(JSON, nullable=False)
+    disk           = Column(JSON, nullable=False)
+    network        = Column(JSON, nullable=False)
+    processes      = Column(JSON, nullable=False)
     cpu_percent    = Column(Float, nullable=True)
     memory_percent = Column(Float, nullable=True)
+
+
+class Alert(Base):
+    """
+    One row = one alert that was triggered.
+
+    Serves two purposes:
+      1. Cooldown: check if we alerted for this server+severity recently
+      2. Audit trail: when was each server alerted, did delivery succeed
+
+    Why not store the full anomaly payload?
+      We only need the z-scores and severity for audit purposes.
+      The full metric data is already in the Metric table — no duplication.
+    """
+    __tablename__ = "alerts"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    server_id      = Column(String, nullable=False, index=True)
+    severity       = Column(String, nullable=False)  # mild | severe
+    triggered_at   = Column(DateTime(timezone=True), nullable=False)
+    cpu_z_score    = Column(Float, nullable=True)
+    memory_z_score = Column(Float, nullable=True)
+    slack_sent     = Column(Boolean, default=False)
+    email_sent     = Column(Boolean, default=False)

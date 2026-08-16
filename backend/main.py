@@ -9,6 +9,9 @@ CS 413 (Adv. Software Eng.) - This is the Open/Closed Principle:
   modification (the agent and any existing clients see no difference).
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from backend.anomaly import AnomalyDetector
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
@@ -18,9 +21,10 @@ from typing import Any
 from datetime import datetime, timezone
 from backend.analyzer import RootCauseAnalyzer
 from backend.anomaly import AnomalyDetector
-
 from backend.database import init_db, get_db
 from backend.models import Metric
+from backend.alerting import AlertManager
+from backend.anomaly import AnomalyDetector
 
 app = FastAPI(
     title="PulseOps API",
@@ -86,6 +90,17 @@ def ingest_metrics(payload: SnapshotPayload, db: Session = Depends(get_db)):
     )
     db.add(metric)
     db.commit()
+
+    # After storing the metric, check for anomalies and alert
+    try:
+        detector = AnomalyDetector(db, payload.server_id)
+        anomaly  = detector.analyze_latest()
+        if anomaly and anomaly.get("is_anomaly"):
+            alerter = AlertManager(db)
+            alerter.trigger(payload.server_id, anomaly)
+    except Exception as e:
+        # Never let alerting crash the ingestion pipeline
+        print(f"[Alert] Alert check error: {e}")
 
     return {
         "status":    "accepted",
