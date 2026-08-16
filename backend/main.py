@@ -26,11 +26,14 @@ from backend.database import init_db, get_db
 from backend.models import Metric
 from backend.alerting import AlertManager
 from backend.anomaly import AnomalyDetector
+from backend.auth import generate_api_key, verify_api_key, hash_key, bearer_scheme
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Security
 
 app = FastAPI(
     title="PulseOps API",
     description="Ingestion and query API for the PulseOps monitoring agent",
-    version="0.2.0",
+    version="0.7.0",
 )
 
 app.add_middleware(
@@ -69,21 +72,28 @@ def root():
     return {
         "service": "PulseOps API",
         "status":  "running",
-        "version": "0.2.0",
+        "version": "0.7.0",
         "time":    datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.post("/api/metrics", status_code=201)
-def ingest_metrics(payload: SnapshotPayload, db: Session = Depends(get_db)):
-    """
-    Writes the snapshot to TimescaleDB.
+def ingest_metrics(
+    payload: SnapshotPayload,
+    db: Session = Depends(get_db),
+    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+):
+    """Ingest metrics — requires valid API key in Authorization header."""
+    # Verify key
+    auth = verify_api_key(credentials, db)
 
-    Depends(get_db) is FastAPI's dependency injection.
-    FastAPI calls get_db(), passes the session to this function,
-    and closes the session automatically when the request is done.
-    We never manually open or close DB sessions in route handlers.
-    """
+    # Ensure server_id in payload matches the registered server
+    if auth["server_id"] != payload.server_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"API key is registered to '{auth['server_id']}', not '{payload.server_id}'"
+        )
+
     metric = Metric(
         timestamp      = datetime.fromisoformat(payload.timestamp),
         server_id      = payload.server_id,
@@ -92,14 +102,12 @@ def ingest_metrics(payload: SnapshotPayload, db: Session = Depends(get_db)):
         disk           = payload.disk,
         network        = payload.network,
         processes      = payload.top_processes,
-        # Extract convenience columns for fast queries
         cpu_percent    = payload.cpu.get("percent_total"),
         memory_percent = payload.memory.get("ram", {}).get("percent_used"),
     )
     db.add(metric)
     db.commit()
 
-    # After storing the metric, check for anomalies and alert
     try:
         detector = AnomalyDetector(db, payload.server_id)
         anomaly  = detector.analyze_latest()
@@ -107,14 +115,9 @@ def ingest_metrics(payload: SnapshotPayload, db: Session = Depends(get_db)):
             alerter = AlertManager(db)
             alerter.trigger(payload.server_id, anomaly)
     except Exception as e:
-        # Never let alerting crash the ingestion pipeline
         print(f"[Alert] Alert check error: {e}")
 
-    return {
-        "status":    "accepted",
-        "server_id": payload.server_id,
-        "timestamp": payload.timestamp,
-    }
+    return {"status": "accepted", "server_id": payload.server_id}
 
 
 @app.get("/api/servers")
@@ -268,3 +271,89 @@ def analyze_server(server_id: str, db: Session = Depends(get_db)):
     analyzer = RootCauseAnalyzer(db)
     result   = analyzer.analyze(server_id, anomaly)
     return result
+
+@app.post("/api/servers/register", status_code=201)
+def register_server(
+    server_id: str,
+    description: str = "",
+    db: Session = Depends(get_db)
+):
+    """
+    Registers a new server and returns its API key.
+    The raw key is shown ONCE — store it in your agent's .env file immediately.
+    """
+    existing = db.execute(text(
+        "SELECT server_id FROM servers WHERE server_id = :id"
+    ), {"id": server_id}).fetchone()
+
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Server '{server_id}' is already registered. Use /rotate to get a new key."
+        )
+
+    raw_key, hashed_key = generate_api_key()
+
+    db.execute(text("""
+        INSERT INTO servers (server_id, api_key_hash, is_active, registered_at, description)
+        VALUES (:server_id, :hash, true, :now, :desc)
+    """), {
+        "server_id": server_id,
+        "hash":      hashed_key,
+        "now":       datetime.now(timezone.utc),
+        "desc":      description,
+    })
+    db.commit()
+
+    return {
+        "server_id":  server_id,
+        "api_key":    raw_key,
+        "warning":    "Store this key in your agent .env as AGENT_API_KEY. It will not be shown again.",
+    }
+
+
+@app.post("/api/servers/{server_id}/rotate")
+def rotate_key(server_id: str, db: Session = Depends(get_db)):
+    """
+    Revokes the current API key and issues a new one.
+    The old key stops working immediately.
+    Update your agent's .env with the new key right away.
+    """
+    server = db.execute(text(
+        "SELECT server_id FROM servers WHERE server_id = :id"
+    ), {"id": server_id}).fetchone()
+
+    if not server:
+        raise HTTPException(status_code=404, detail=f"Server '{server_id}' not found.")
+
+    raw_key, hashed_key = generate_api_key()
+
+    db.execute(text("""
+        UPDATE servers
+        SET api_key_hash    = :hash,
+            is_active       = true,
+            last_rotated_at = :now
+        WHERE server_id = :id
+    """), {"hash": hashed_key, "now": datetime.now(timezone.utc), "id": server_id})
+    db.commit()
+
+    return {
+        "server_id":  server_id,
+        "api_key":    raw_key,
+        "rotated_at": datetime.now(timezone.utc).isoformat(),
+        "warning":    "Old key is now invalid. Update your agent .env immediately.",
+    }
+
+
+@app.get("/api/servers/{server_id}/status")
+def server_status(server_id: str, db: Session = Depends(get_db)):
+    """Returns registration status for a server."""
+    server = db.execute(text("""
+        SELECT server_id, is_active, registered_at, last_rotated_at, description
+        FROM servers WHERE server_id = :id
+    """), {"id": server_id}).fetchone()
+
+    if not server:
+        raise HTTPException(status_code=404, detail=f"Server '{server_id}' not found.")
+
+    return dict(server._mapping)

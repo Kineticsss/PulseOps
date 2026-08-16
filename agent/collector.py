@@ -31,12 +31,16 @@ class MetricsCollector:
         - http                : reused TCP connection (cheaper than new conn each time)
     """
 
-    def __init__(self, server_id: str, api_url: str, interval_seconds: int = 5):
+    def __init__(self, server_id: str, api_url: str, api_key: str, interval_seconds: int = 5):
         self.server_id = server_id
-        self.api_url = api_url
-        self.interval = interval_seconds
-        self.http = httpx.Client(timeout=10.0)
-        self._prev_net = None
+        self.api_url   = api_url
+        self.api_key   = api_key
+        self.interval  = interval_seconds
+        self.http      = httpx.Client(
+            timeout=10.0,
+            headers={"Authorization": f"Bearer {api_key}"}
+        )
+        self._prev_net      = None
         self._prev_net_time = None
 
     def collect_cpu(self) -> dict:
@@ -214,9 +218,14 @@ class MetricsCollector:
 
 
 if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
     collector = MetricsCollector(
-        server_id="my-server-01",
-        api_url="http://localhost:8000",
-        interval_seconds=5,
+        server_id        = os.getenv("SERVER_ID", "my-server-01"),
+        api_url          = os.getenv("API_URL", "http://localhost:8000"),
+        api_key          = os.getenv("AGENT_API_KEY", ""),
+        interval_seconds = int(os.getenv("AGENT_INTERVAL", "5")),
     )
     collector.run(dry_run=False)
