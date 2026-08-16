@@ -14,6 +14,7 @@ load_dotenv()
 
 from backend.anomaly import AnomalyDetector
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -30,6 +31,13 @@ app = FastAPI(
     title="PulseOps API",
     description="Ingestion and query API for the PulseOps monitoring agent",
     version="0.2.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
