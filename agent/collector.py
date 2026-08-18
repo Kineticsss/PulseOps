@@ -37,7 +37,7 @@ class MetricsCollector:
         self.api_key   = api_key
         self.interval  = interval_seconds
         self.http      = httpx.Client(
-            timeout=10.0,
+            timeout=30.0,
             headers={"Authorization": f"Bearer {api_key}"}
         )
         self._prev_net      = None
