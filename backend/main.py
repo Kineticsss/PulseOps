@@ -8,7 +8,7 @@ CS 413 (Adv. Software Eng.) - This is the Open/Closed Principle:
   The API is open for extension (we added a database) but closed for
   modification (the agent and any existing clients see no difference).
 """
-
+import os
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -38,7 +38,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -56,7 +56,7 @@ interface LatestSnapshot {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const API           = "http://localhost:8000";
+const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const POLL_MS       = 5000;
 const HISTORY_LIMIT = 60;
 
